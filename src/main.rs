@@ -43,7 +43,7 @@ struct SsdpClient {}
 
 const BROADCAST_MESSAGE: &str = "\
     M-SEARCH * HTTP/1.1\r\n\
-    HOST: 239.255.255.200:1900\r\n\
+    HOST: 239.255.255.250:1900\r\n\
     MAN: \"ssdp:discover\"\r\n\
     ST: \"upnp:rootdevice\"\r\n\
     USER-AGENT: Rust/0.1 UPnP/1.1 huenotify/0.1\r\n\
