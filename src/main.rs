@@ -49,9 +49,11 @@ const BROADCAST_MESSAGE: &str = "\
     USER-AGENT: Rust/0.1 UPnP/1.1 huenotify/0.1\r\n\
     ";
 
-fn parse_headers<'a>(message: &str) -> Result<HeaderMap> {
+// Parse a M-SEARCH response
+fn parse_search_response<'a>(message: &str) -> Result<HeaderMap> {
     // split on \n, even though it might be \r\n
     let (_method_proto, headers) = message.split_once('\n').unwrap_or_default();
+    assert!(_method_proto.trim_end() == "HTTP/1.1 200 OK", "unexpected response line: {}", _method_proto.trim_end());
     Ok(headers
         .split('\n')
         .flat_map(|line| line.split_once(": "))
@@ -61,7 +63,26 @@ fn parse_headers<'a>(message: &str) -> Result<HeaderMap> {
 
 #[test]
 fn simple_parse_headers() {
-    let hdrs = parse_headers(BROADCAST_MESSAGE).unwrap();
+    let hdrs = parse_search_response(BROADCAST_MESSAGE).unwrap();
+    assert_ne!(hdrs.len(), 0, "expected some headers to be parsed");
+    assert_eq!(*hdrs.get("HOST").unwrap(), "239.255.255.200:1900");
+    assert_eq!(*hdrs.get("USER-AGENT").unwrap(), "Rust/0.1 UPnP/1.1 huenotify/0.1");
+    dbg!(hdrs);
+}
+
+#[test]
+fn untrimmed_parse_headers() {
+    let text = "HTTP/1.1 200 OK\r\n\
+        HOST: 239.255.255.250:1900\r\n\
+        EXT:\r\n\
+        CACHE-CONTROL: max-age=100\r\n\
+        LOCATION: http://192.168.1.22:80/description.xml\r\n\
+        SERVER: Hue/1.0 UPnP/1.0 IpBridge/1.44.0\r\n\
+        hue-bridgeid: FAFAFAFFFECECE25\r\n\
+        ST: upnp:rootdevice\r\n\
+        USN: uuid:5ba27c1b-b3c3-4da3-ac78-16efe35582f6::upnp:rootdevice\r\n\r\n";
+
+    let hdrs = parse_search_response(text).unwrap();
     assert_ne!(hdrs.len(), 0, "expected some headers to be parsed");
     assert_eq!(*hdrs.get("HOST").unwrap(), "239.255.255.200:1900");
     assert_eq!(*hdrs.get("USER-AGENT").unwrap(), "Rust/0.1 UPnP/1.1 huenotify/0.1");
@@ -88,7 +109,7 @@ async fn read_devices(token: CancellationToken, socket: UdpSocket) -> Result<Vec
         }
         let resp = std::str::from_utf8(&buf[0..len])?;
         println!("msg: {:?}", resp);
-        let headers = parse_headers(resp)?;
+        let headers = parse_search_response(resp)?;
 
         if let Some(bridge) = Bridge::from_headers(headers) {
             devices.push(bridge);
