@@ -260,10 +260,19 @@ async fn main() {
     }
 }
 
-type ListLightsResponse = HashMap<String, Light>;
+// Json type
+type ListLightsResponse = HashMap<String, LightName>;
 
+// Json type
 #[derive(Serialize, Deserialize, Debug, Clone)]
+struct LightName {
+    name: String,
+}
+
+#[derive(Debug, Clone)]
+// App type
 struct Light {
+    id: String,
     name: String,
 }
 
@@ -283,8 +292,11 @@ impl AuthenticatedBridge {
         Ok(res
             .json::<ListLightsResponse>()
             .await?
-            .values()
-            .cloned()
+
+            .iter()
+            .map(|(id, LightName{name})| {
+                Light {id: id.clone(), name: name.clone()}
+            })
             .collect())
     }
 }
