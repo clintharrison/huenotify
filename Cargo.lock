@@ -319,6 +319,7 @@ dependencies = [
  "structopt",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]
@@ -764,6 +765,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "serde",
+ "serde_json",
  "serde_urlencoded",
  "tokio",
  "tokio-native-tls",

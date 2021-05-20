@@ -2,11 +2,12 @@
 
 use std::{collections::HashMap, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use structopt::StructOpt;
 use tokio::net::UdpSocket;
 use tokio_util::sync::CancellationToken;
+use url::Url;
 #[derive(PartialEq, Eq, Debug, Clone)]
 struct Bridge {
     location: String,
@@ -15,9 +16,6 @@ struct Bridge {
     usn: String,
     hue_bridge_id: String,
 }
-
-#[derive(PartialEq, Eq, Debug, Clone)]
-struct HueDevice {}
 
 impl<'a> Bridge {
     fn from_headers(headers: HeaderMap<'a>) -> Option<Self> {
@@ -40,8 +38,9 @@ impl<'a> Bridge {
         }
     }
 
-    fn list_devices(&mut self) -> Result<Vec<HueDevice>> {
-        unimplemented!("list_devices unimplemented")
+    fn short_name(&self) -> String{
+        let description_xml: Url = Url::parse(&self.location).expect("could not parse self.location");
+        Url::parse(&description_xml[..url::Position::BeforePath]).expect("could not find partial path").to_string()
     }
 }
 type HeaderMap<'a> = HashMap<&'a str, &'a str>;
@@ -74,7 +73,7 @@ fn parse_search_response<'a>(message: &str) -> Result<HeaderMap> {
 
 #[test]
 fn simple_parse_headers() {
-    let hdrs = parse_search_response(BROADCAST_MESSAGE).unwrap();
+    let hdrs = parse_search_response(BROADCAST_MESSAGE).expect("broadcast message must parse");
     assert_ne!(hdrs.len(), 0, "expected some headers to be parsed");
     assert_eq!(*hdrs.get("HOST").unwrap(), "239.255.255.200:1900");
     assert_eq!(
@@ -123,7 +122,7 @@ async fn read_bridges(
     let timeout = if mode == ReadMode::List {
         Duration::from_secs(3600)
     } else {
-        Duration::from_millis(2000)
+        Duration::from_millis(5000)
     };
 
     loop {
@@ -142,6 +141,10 @@ async fn read_bridges(
                 println!("{:?}", &bridge);
             }
             bridges.push(bridge);
+
+            if mode == ReadMode::EarlyExit {
+                break;
+            }
         }
     }
     Ok(bridges)
@@ -176,7 +179,7 @@ struct Args {
     timeout: u64,
 
     #[structopt(long)]
-    auto_register: bool,
+    no_auto_register: bool,
 
     #[structopt(subcommand)]
     cmd: Command,
@@ -186,7 +189,7 @@ struct Args {
 enum Command {
     ListBridges {},
 
-    ListDevices {},
+    ListLights {},
 
     Poke {
         quantity: u64,
@@ -207,7 +210,7 @@ async fn main() {
     match args {
         Args {
             timeout,
-            auto_register: _,
+            no_auto_register: _,
             cmd: Command::ListBridges {},
         } => {
             let bridges = SsdpClient::broadcast_discover(timeout, ReadMode::List).await;
@@ -220,42 +223,80 @@ async fn main() {
         }
         Args {
             timeout,
-            auto_register,
-            cmd: Command::ListDevices {},
+            no_auto_register,
+            cmd: Command::ListLights {},
         } => {
-            match get_one_bridge(timeout, auto_register).await {
-                Ok(bridge) => {
-                    println!("Using bridge {:?}", &bridge);
+            match get_one_bridge(timeout, !no_auto_register).await {
+                Ok(authed_bridge) => {
+                    println!(
+                        "Using bridge {} as user {}",
+                        &authed_bridge.bridge.short_name(), &authed_bridge.username
+                    );
+                    let lights = authed_bridge
+                        .list_lights()
+                        .await
+                        .expect("could not retrieve list of lights");
+                    for light in lights {
+                        println!("{:?}", light);
+                    }
                 }
-                _ => {
-                    println!("could not get a hue bridge");
+                Err(err) => {
+                    println!("could not get a hue bridge, {:?}", err);
                 }
             };
         }
         Args {
             timeout,
-            auto_register,
+            no_auto_register,
             cmd:
                 Command::Poke {
-                    quantity,
-                    duration,
-                    target,
+                    quantity: _,
+                    duration: _,
+                    target: _,
                 },
         } => {
-            let bridge = get_one_bridge(timeout, auto_register).await;
+            let _bridge = get_one_bridge(timeout, !no_auto_register).await;
         }
     }
 }
 
-async fn get_one_bridge(timeout: u64, auto_register: bool) -> Result<Bridge> {
-    let device = SsdpClient::broadcast_discover(timeout, ReadMode::EarlyExit).await;
-    match device {
-        Ok(mut devices) if devices.len() == 1 => {
-            let device = devices.remove(0);
-            println!("using first discovered device: {:?}", &device);
-            let username = fetch_username(&device, auto_register)?;
+type ListLightsResponse = HashMap<String, Light>;
 
-            Ok(device)
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Light {
+    name: String,
+}
+
+struct AuthenticatedBridge {
+    username: String,
+    bridge: Bridge,
+}
+
+impl AuthenticatedBridge {
+    async fn list_lights(&self) -> Result<Vec<Light>> {
+        let url = url_for_bridge(
+            &self.bridge,
+            format!("/api/{}/lights", &self.username).as_str(),
+        )
+        .expect("could not construct url for lights");
+        let res = reqwest::get(url).await?;
+        Ok(res
+            .json::<ListLightsResponse>()
+            .await?
+            .values()
+            .cloned()
+            .collect())
+    }
+}
+
+async fn get_one_bridge(timeout: u64, auto_register: bool) -> Result<AuthenticatedBridge> {
+    let res = SsdpClient::broadcast_discover(timeout, ReadMode::EarlyExit).await;
+    match res {
+        Ok(mut bridges) if bridges.len() == 1 => {
+            let bridge = bridges.remove(0);
+            let username = fetch_username(&bridge, auto_register).await?;
+
+            Ok(AuthenticatedBridge { username, bridge })
         }
         Ok(_) => {
             anyhow::bail!("no bridges found")
@@ -264,46 +305,100 @@ async fn get_one_bridge(timeout: u64, auto_register: bool) -> Result<Bridge> {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 struct AppConfig {
-    bridges: Vec<BridgeConfig>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct BridgeConfig {
-    hue_bridge_id: String,
-    username: String,
+    bridges: HashMap<String, String>,
 }
 
 impl ::std::default::Default for AppConfig {
     fn default() -> Self {
-        Self { bridges: vec![] }
-    }
-}
-
-// todo: take path as a param or something so we can test this
-fn fetch_username(bridge: &Bridge, auto_register: bool) -> Result<String> {
-    let config: AppConfig = confy::load("huenotify")?;
-    match config
-        .bridges
-        .iter()
-        .find(|b| b.hue_bridge_id == bridge.hue_bridge_id)
-    {
-        Some(BridgeConfig {
-            hue_bridge_id: _,
-            username,
-        }) => Ok(username.clone()),
-        None => {
-            anyhow::ensure!(
-                auto_register,
-                "a username was not found in the config for {:?}, and auto_register is false",
-                bridge.hue_bridge_id
-            );
-            try_auto_register(bridge)
+        Self {
+            bridges: HashMap::new(),
         }
     }
 }
 
-fn try_auto_register(bridge: &Bridge) -> Result<String> {
-    unimplemented!("auto register not enabled yet")
+// todo: take path as a param or something so we can test this
+async fn fetch_username(bridge: &Bridge, auto_register: bool) -> Result<String> {
+    let config: AppConfig = confy::load("huenotify")?;
+
+    if let Some(username) = config.bridges.get(&bridge.hue_bridge_id) {
+        Ok(username.clone())
+    } else {
+        anyhow::ensure!(
+            auto_register,
+            "a username was not found in the config for {:?}, and auto_register is false",
+            bridge.hue_bridge_id
+        );
+        try_auto_register(config, bridge).await
+    }
+}
+
+fn url_for_bridge(bridge: &Bridge, path: &str) -> Result<Url, url::ParseError> {
+    let description_xml: Url = Url::parse(&bridge.location)?;
+    Url::parse(&description_xml[..url::Position::BeforePath])?.join(path)
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct RegisterResponse {
+    success: RegisterResponseSuccess,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct RegisterResponseSuccess {
+    username: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct HueErrorResponse {
+    error: HueErrorType,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct HueErrorType {
+    #[serde(rename = "type")]
+    error_type: u64,
+    address: String,
+    description: String,
+}
+
+async fn try_auto_register(mut config: AppConfig, bridge: &Bridge) -> Result<String> {
+    println!("trying to auto register...");
+    let registration_url = url_for_bridge(bridge, "/api");
+    let client = reqwest::Client::new();
+
+    let body: HashMap<&str, &str> = [("devicetype", "huenotify")].iter().cloned().collect();
+
+    let res = client.post(registration_url.expect("registration url must be valid"));
+
+    let res = res.json(&body).send().await?;
+
+    let body = res.text().await?;
+
+    let register_responses: Vec<RegisterResponse> = match serde_json::de::from_str(&body).context("deserializing response from register request") {
+        Ok(rs) => rs,
+        Err(e) => {
+            if let Ok(hue_error) = serde_json::de::from_str::<Vec<HueErrorResponse>>(&body) {
+                anyhow::bail!("got hue error message!\n{:#?}", &hue_error);
+            };
+            anyhow::bail!("got an error from register response: {}", e)
+        }
+    };
+
+    anyhow::ensure!(
+        register_responses.len() == 1,
+        "register response should have one result:\n{:#?}",
+        register_responses
+    );
+
+    let username = register_responses[0].success.username.clone();
+    println!("got a username {}", username);
+    if let Some(x) = config.bridges.get_mut(&bridge.hue_bridge_id) {
+        *x = username.clone();
+    }
+    if let Err(err) = confy::store("huenotify", config) {
+        println!("couldn't save config! {:?}", err);
+    }
+
+    Ok(username)
 }
